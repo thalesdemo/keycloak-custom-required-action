@@ -24,6 +24,8 @@ import org.keycloak.events.Details;
 import org.keycloak.events.Errors;
 import org.keycloak.events.EventBuilder;
 import org.keycloak.events.EventType;
+import org.keycloak.forms.login.LoginFormsProvider;
+import org.keycloak.models.Constants;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.models.ModelException;
@@ -39,26 +41,19 @@ import org.keycloak.sessions.AuthenticationSessionModel;
 import javax.ws.rs.core.MultivaluedMap;
 import javax.ws.rs.core.Response;
 
-import java.util.List;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
 
-import static java.util.Arrays.asList;
-
 /**
  * @author <a href="mailto:bill@burkecentral.com">Bill Burke</a>
- * @author <a href="mailto:hello@onewelco.me">Cina Shaykhian</a>
- * @comments Mostly inspired on UpdatePassword.java from Keycloak, with a few
- *           modifications to satisfy the use case
- * @version $Revision: 2 $
- * 
+ *         Modified -- Cina Shaykhian
+ * @version $Revision: 1 $
  */
-public class SafeNetOnboardingRequiredAction implements RequiredActionProvider, RequiredActionFactory {
-    private static final Logger logger = Logger.getLogger(SafeNetOnboardingRequiredAction.class);
-    private static final String REQUIRED_ACTION_ID = "safenet-mfa-onboarding";
-    private static final String PASSWORD_SET_FLAG = "password-set";
-    private static final String PASSWORD_SET_STRING = "true";
+public class PasswordUpdateWithRedirect implements RequiredActionProvider, RequiredActionFactory {
+    private static final Logger logger = Logger.getLogger(PasswordUpdateWithRedirect.class);
+    private static final String REQUIRED_ACTION_ID = "custo-password-update-with-redirect";
 
     @Override
     public InitiatedActionSupport initiatedActionSupport() {
@@ -67,16 +62,8 @@ public class SafeNetOnboardingRequiredAction implements RequiredActionProvider, 
 
     @Override
     public void evaluateTriggers(RequiredActionContext context) {
-
-        UserModel user = context.getUser();
-
-        Map<String, List<String>> attributes = user.getAttributes();
-        List<String> list = attributes.get(PASSWORD_SET_FLAG);
-
-        if (list == null || list.isEmpty()) {
-            user.addRequiredAction(REQUIRED_ACTION_ID);
-        }
-
+        // NOOP
+        // Required action to be manually added to the user
     }
 
     @Override
@@ -89,31 +76,20 @@ public class SafeNetOnboardingRequiredAction implements RequiredActionProvider, 
 
     @Override
     public void processAction(RequiredActionContext context) {
-
-        UserModel user = context.getUser();
-
-        Map<String, List<String>> attributes = user.getAttributes();
-        List<String> list = attributes.get(PASSWORD_SET_FLAG);
-
-        if (list != null && !list.isEmpty() && list.get(0).equalsIgnoreCase(PASSWORD_SET_STRING)) {
-            logger.debug("User has already been onboarded: " + user.getUsername());
-            return;
-        }
-
-        if (user.getRequiredActionsStream()
-                .anyMatch(action -> action.equals(UserModel.RequiredAction.UPDATE_PASSWORD.name()))) {
-            user.removeRequiredAction(UserModel.RequiredAction.UPDATE_PASSWORD.name());
-        }
-
         EventBuilder event = context.getEvent();
         AuthenticationSessionModel authSession = context.getAuthenticationSession();
         RealmModel realm = context.getRealm();
-
+        UserModel user = context.getUser();
         KeycloakSession session = context.getSession();
         MultivaluedMap<String, String> formData = context.getHttpRequest().getDecodedFormParameters();
         event.event(EventType.UPDATE_PASSWORD);
         String passwordNew = formData.getFirst("password-new");
         String passwordConfirm = formData.getFirst("password-confirm");
+
+        // Creating model for the redirect action
+        Map<String, Object> model = new HashMap<>();
+        model.put("url", session.getContext().getUri().getBaseUri());
+        model.put("realm", realm.getName());
 
         EventBuilder errorEvent = event.clone().event(EventType.UPDATE_PASSWORD_ERROR)
                 .client(authSession.getClient())
@@ -137,31 +113,40 @@ public class SafeNetOnboardingRequiredAction implements RequiredActionProvider, 
             return;
         }
 
-        session.sessions().getUserSessionsStream(realm, user)
-                .filter(s -> !Objects.equals(s.getId(), authSession.getParentSession().getId()))
-                .collect(Collectors.toList()) // collect to avoid concurrent modification as backchannelLogout
-                                              // removes the user sessions.
-                .forEach(s -> {
-
-                    AuthenticationManager.backchannelLogout(session, realm, s, session.getContext().getUri(),
-                            context.getConnection(), context.getHttpRequest().getHttpHeaders(), true);
-                    logger.info("User session " + s.getId() + " logged out after password update for user: "
-                            + user.getUsername());
-                });
+        if (getId().equals(authSession.getClientNote(Constants.KC_ACTION_EXECUTING))
+                && "on".equals(formData.getFirst("logout-sessions"))) {
+            session.sessions().getUserSessionsStream(realm, user)
+                    .filter(s -> !Objects.equals(s.getId(), authSession.getParentSession().getId()))
+                    .collect(Collectors.toList()) // collect to avoid concurrent modification as backchannelLogout
+                                                  // removes the user sessions.
+                    .forEach(s -> AuthenticationManager.backchannelLogout(session, realm, s,
+                            session.getContext().getUri(),
+                            context.getConnection(), context.getHttpRequest().getHttpHeaders(), true));
+        }
 
         try {
+            // Update user with the new password (may fail if does not match policy)
             user.credentialManager().updateCredential(UserCredentialModel.password(passwordNew, false));
-            logger.info("Password updated for user: " + user.getUsername());
 
-            user.setAttribute(PASSWORD_SET_FLAG,
-                    asList(PASSWORD_SET_STRING));
+            // Remove update_password if any left attached to the user
+            if (user.getRequiredActionsStream()
+                    .anyMatch(action -> action.equals(UserModel.RequiredAction.UPDATE_PASSWORD.name()))) {
+                user.removeRequiredAction(UserModel.RequiredAction.UPDATE_PASSWORD.name());
+            }
 
+            // Remove the required action from the user
             user.removeRequiredAction(REQUIRED_ACTION_ID);
 
-            String errorMessage = "Your password has been successfully updated, you must re-authenticate to access the application.";
-            Response response = context.form()
-                    .setError(errorMessage)
-                    .createErrorPage(Response.Status.UNAUTHORIZED);
+            // Obtain the LoginFormsProvider instance
+            LoginFormsProvider formsProvider = context.form();
+
+            // Inject the model into the form
+            formsProvider.setAttribute("model", model);
+
+            // Create the Keycloak form
+            Response response = formsProvider.createForm("redirect.ftl");
+
+            // Redirect the user to the application login page
             context.challenge(response);
 
         } catch (ModelException me) {
@@ -205,7 +190,7 @@ public class SafeNetOnboardingRequiredAction implements RequiredActionProvider, 
 
     @Override
     public String getDisplayText() {
-        return "SafeNet MFA Onboarding";
+        return "Password Update With Redirect";
     }
 
     @Override
