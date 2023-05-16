@@ -1,1 +1,1 @@
-com.thalesdemo.keycloak.custom.required.action.PasswordSetFlagFirstLoginRequiredActionFactory
+com.thalesdemo.keycloak.custom.required.action.SafeNetOnboardingRequiredAction
