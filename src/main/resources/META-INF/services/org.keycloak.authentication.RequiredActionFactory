@@ -1,1 +1,1 @@
-com.thalesdemo.keycloak.custom.required.action.SafeNetOnboardingRequiredAction
+com.thalesdemo.keycloak.custom.required.action.PasswordUpdateWithRedirect
